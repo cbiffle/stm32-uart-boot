@@ -5,15 +5,14 @@
 //! makes sense to have both kinds of commands for a single concept, the
 //! low-level one is typically prefixed with `raw-`.
 
-use std::{time::Duration, io::{ErrorKind, Write}, path::PathBuf, fmt::Display};
+use std::{time::Duration, path::PathBuf};
 
-use anyhow::{Context, Result, anyhow, bail};
-use enum_map::{EnumMap, Enum};
+use anyhow::{Context, Result, bail};
+use enum_map::Enum;
 use indicatif::ProgressBar;
-use serialport::{SerialPort, Parity};
-use num_derive::FromPrimitive;
-use num_traits::FromPrimitive;
+use serialport::Parity;
 use clap::Parser;
+use stm32_uart_boot::{Boot, Cmd, Pid};
 
 /// A tool for interacting with the built-in UART bootloader on most STM32
 /// parts.
@@ -145,7 +144,7 @@ enum SubCmd {
 fn main() -> Result<()> {
     let args = BootTool::parse();
 
-    let mut boot = Boot(serialport::new(&args.port, args.baud_rate)
+    let mut boot = Boot::new(serialport::new(&args.port, args.baud_rate)
         .timeout(Duration::from_millis(500))
         .parity(Parity::Even)
         .open()
@@ -161,44 +160,34 @@ fn main() -> Result<()> {
             println!("successfully poked device");
         }
         SubCmd::Info => {
-            let (version, commands) = boot.do_get()?;
-            let (major, minor) = (version >> 4, version & 0xF);
-
+            let info = boot.info()?;
+            let (major, minor) = info.version;
             println!("Protocol version: {major}.{minor}");
             println!("Known commands supported:");
             for i in 0..Cmd::LENGTH {
                 let c = <Cmd as Enum>::from_usize(i);
-                let f = if commands[c] { "YES" } else { "no" };
+                let f = if info.command_support[c] { "YES" } else { "no" };
                 println!("{:24} {f}", format!("{c:?}"));
             }
 
-            if commands[Cmd::GetId] {
-                let pid = boot.do_get_id()?;
+            if let Some(pid) = info.product_id {
                 match pid {
-                    Pid::Stm32(kind) => {
-                        println!("STM32: {kind:?}");
-                        if commands[Cmd::ReadMemory] {
-                            let blid_addr = kind.bootloader_id_address();
-                            let mut blid = 0;
-                            boot.do_read_memory(blid_addr, std::slice::from_mut(&mut blid))?;
-
-                            let (ifaces, version) = decode_blid(blid);
-
-                            println!("Bootloader ID: {blid:#x}");
-                            print!(" - interfaces:");
-                            for (i, _) in ifaces.iter_names() {
-                                print!(" {i}");
-                            }
-                            println!();
-                            println!(" - version: {version}");
-                        } else {
-                            println!("ReadMemory not supported, can't say more");
-                        }
-                    }
+                    Pid::Stm32(kind) => println!("STM32: {kind:?}"),
                     Pid::Other(bytes) => println!("unknown: {bytes:?}"),
                 }
             } else {
-                println!("GetId not supported, can't say more");
+                println!("Product ID unsupported.");
+            }
+
+            if let Some(ifaces) = info.bootloader_interfaces {
+                print!("Bootloader interfaces: ");
+                for (i, _) in ifaces.iter_names() {
+                    print!(" {i}");
+                }
+                println!();
+            }
+            if let Some(v) = info.bootloader_version {
+                println!("Bootloader version: {v}");
             }
         }
         SubCmd::Get => {
@@ -255,7 +244,7 @@ fn main() -> Result<()> {
             let bound = address + count;
 
             let mut data = Vec::with_capacity(count as usize);
-            let mut buffer = vec![0; 256];
+            let mut buffer = [0u8; 256];
             println!("reading {count} bytes...");
             let bar = ProgressBar::new(u64::from(count));
             while address < bound {
@@ -338,12 +327,12 @@ fn main() -> Result<()> {
             boot.do_write_memory(address, &data)?;
         }
         SubCmd::GlobalErase => {
-            let (_, commands) = boot.do_get()
-                .with_context(|| format!("checking command support"))?;
+            let info = boot.info()
+                .context("checking command support")?;
 
-            if commands[Cmd::EraseMemory] {
+            if info.command_support[Cmd::EraseMemory] {
                 boot.do_erase_memory_global()?;
-            } else if commands[Cmd::ExtendedEraseMemory] {
+            } else if info.command_support[Cmd::ExtendedEraseMemory] {
                 boot.do_extended_erase_memory_global()?;
             } else {
                 bail!("device does not report any supported erase memory commands");
@@ -428,472 +417,4 @@ fn do_verify(
         bail!("memory contents failed to match at {issues} addresses");
     }
     Ok(())
-}
-
-struct Boot(Box<dyn SerialPort>);
-
-impl Boot {
-    fn drain(&mut self) -> Result<()> {
-        let saved_timeout = self.0.timeout();
-
-        self.0.set_timeout(Duration::from_millis(1))
-            .context("reducing timeout for drain")?;
-
-        let mut buffer = [0; 32];
-        let mut cruft = 0_usize;
-        loop {
-            match self.0.read(&mut buffer) {
-                Ok(n) => cruft += n,
-                Err(e) if e.kind() == ErrorKind::TimedOut => {
-                    break;
-                }
-                Err(e) => return Err(e)
-                    .context("attempting to drain buffer"),
-            }
-        }
-        self.0.set_timeout(saved_timeout)
-            .context("restoring timeout after drain")?;
-
-        if cruft > 0 {
-            println!("note: {cruft} bytes of cruft drained from serial port");
-        }
-
-        Ok(())
-    }
-
-    fn poke(&mut self) -> Result<()> {
-        self.0.write_all(&[0x7F])?;
-
-        let saved_timeout = self.0.timeout();
-        self.0.set_timeout(Duration::from_millis(100))?;
-        let mut response = 0;
-        match self.0.read_exact(std::slice::from_mut(&mut response)) {
-            Ok(()) => (),
-            Err(e) if e.kind() == ErrorKind::TimedOut => {
-                // Chances are pretty good that it's already sitting in the
-                // bootloader. In that case, it's one byte through its command
-                // sequence. Unblock it.
-                self.0.write_all(&[0x7F])?;
-                // Treat a timeout here as an actual failure to communicate.
-                self.0.read_exact(std::slice::from_mut(&mut response))?;
-            }
-            Err(e) => return Err(e).context("reading poke response"),
-        };
-        self.0.set_timeout(saved_timeout)?;
-        if response == 0x79 {
-            Ok(())
-        } else if response == 0x1f {
-            // it's already in command processing. This is a NACK. Tolerate it.
-            Ok(())
-        } else {
-            Err(anyhow!("bad ack: {response:#x}"))
-        }
-    }
-
-    fn send_with_check_base(&mut self, base: u8, data: &[u8]) -> Result<()> {
-        let check = data.iter().fold(base, |x, byte| x ^ *byte);
-        self.0.write_all(data)?;
-        self.0.write_all(std::slice::from_ref(&check))?;
-        Ok(())
-    }
-
-    fn send_with_check(&mut self, data: &[u8]) -> Result<()> {
-        self.send_with_check_base(0xFF, data)
-    }
-
-    fn send_with_check_inv(&mut self, data: &[u8]) -> Result<()> {
-        self.send_with_check_base(0, data)
-    }
-
-    fn send_cmd(&mut self, cmd: Cmd) -> Result<()> {
-        self.send_with_check(&[cmd as u8])
-            .with_context(|| format!("failed to transmit command {cmd:?}"))?;
-        self.get_ack()
-            .with_context(|| format!("failed to issue command {cmd:?}"))?;
-        Ok(())
-    }
-
-    fn get_ack(&mut self) -> Result<()> {
-        let mut response = 0;
-        self.0.read_exact(std::slice::from_mut(&mut response))?;
-        match response {
-            0x79 => Ok(()),
-            0x1F => Err(anyhow!("received NACK")),
-            _ => Err(anyhow!("expected ACK or NACK, got: {response:#x}")),
-        }
-    }
-
-    fn do_get(&mut self) -> Result<(u8, EnumMap<Cmd, bool>)> {
-        self.send_cmd(Cmd::Get)?;
-        let mut byte_count = 0;
-        self.0.read_exact(std::slice::from_mut(&mut byte_count))?;
-        let byte_count = usize::from(byte_count) + 1;
-        let mut buffer = [0; 256];
-        self.0.read_exact(&mut buffer[..byte_count])?;
-        self.get_ack()?;
-
-        let version = buffer[0];
-
-        let mut commands = EnumMap::default();
-        for &cmd in &buffer[1..byte_count] {
-            if let Some(known) = Cmd::from_u8(cmd) {
-                commands[known] = true;
-            }
-        }
-
-        Ok((version, commands))
-    }
-
-    fn require_cmd(&mut self, cmd: Cmd) -> Result<()> {
-        let (_, commands) = self.do_get()
-            .with_context(|| format!("can't determine if command {cmd:?} is supported"))?;
-        if commands[cmd] {
-            Ok(())
-        } else {
-            bail!("command {cmd:?} not supported by device");
-        }
-    }
-
-    fn do_get_id(&mut self) -> Result<Pid> {
-        self.send_cmd(Cmd::GetId)?;
-        let mut byte_count = 0;
-        self.0.read_exact(std::slice::from_mut(&mut byte_count))?;
-        let byte_count = usize::from(byte_count) + 1;
-        let mut buffer = [0; 257];
-        self.0.read_exact(&mut buffer[..byte_count])?;
-
-        if byte_count == 2 && buffer[0] == 0x04 {
-            if let Some(kind) = Stm32Kind::from_u8(buffer[1]) {
-                return Ok(Pid::Stm32(kind))
-            }
-        }
-
-        Ok(Pid::Other(buffer[..byte_count].to_vec()))
-    }
-
-    fn do_read_memory(&mut self, address: u32, dest: &mut [u8]) -> Result<()> {
-        let count = dest.len();
-        let count_m1 = count.checked_sub(1).expect("read size can't be 0");
-        let count_m1 = u8::try_from(count_m1).expect("read size can't be > 256");
-
-        context_scope(
-            || {
-                self.send_cmd(Cmd::ReadMemory)?;
-
-                self.send_with_check_inv(&address.to_be_bytes())
-                    .context("failed to send address to bootloader")?;
-                self.get_ack()
-                    .context("bootloader did not accept address")?;
-
-                self.send_with_check(std::slice::from_ref(&count_m1))
-                    .context("failed to send count to bootloader")?;
-                self.get_ack()
-                    .context("bootloader did not accept count")?;
-
-                self.0.read_exact(dest)?;
-                Ok(())
-            },
-
-            || format!("failed to read {count} bytes from address {address:#x}"),
-        )
-    }
-
-    fn do_write_memory(&mut self, address: u32, src: &[u8]) -> Result<()> {
-        let count = src.len();
-        assert!(count % 4 == 0, "must write in units of 4 bytes");
-        let count_m1 = count.checked_sub(1).expect("can't read 0 bytes");
-        let count_m1 = u8::try_from(count_m1).expect("can't read more than 256 bytes");
-
-        context_scope(
-            || {
-                self.send_cmd(Cmd::WriteMemory)?;
-
-                self.send_with_check_inv(&address.to_be_bytes())
-                    .context("failed to send address to bootloader")?;
-                self.get_ack()
-                    .context("bootloader did not accept address")?;
-
-                // Copy here is kind of lame but hey
-                let mut buffer = vec![0; src.len() + 1];
-                buffer[0] = count_m1;
-                buffer[1..].copy_from_slice(src);
-                self.send_with_check_inv(&buffer)
-                    .context("failed to send count+data to bootloader")?;
-                self.get_ack()
-                    .context("bootloader did not accept count+data")?;
-                Ok(())
-            },
-            || format!("failed to write {count} bytes to address {address:#x}"),
-        )
-    }
-
-    fn do_erase_memory(&mut self, pages: &[u8]) -> Result<()> {
-        let count = pages.len();
-        let count_m1 = count.checked_sub(1).expect("erase-memory size cannot be 0");
-        let count_m1 = u8::try_from(count_m1).expect("can't erase more than 255 pages at a time");
-        if count_m1 == 255 {
-            panic!("can't erase more than 255 pages at a time");
-        }
-
-        context_scope(
-            || {
-                self.send_cmd(Cmd::EraseMemory)?;
-
-                // Copy here is kind of lame but hey
-                let mut buffer = vec![0; pages.len() + 1];
-                buffer[0] = count_m1;
-                buffer[1..].copy_from_slice(pages);
-                self.send_with_check_inv(&buffer)
-                    .context("failed to send page addresses to bootloader")?;
-                self.get_ack()
-                    .context("bootloader did not accept page addresses")?;
-                Ok(())
-            },
-            || format!("failed to erase {count} pages"),
-        )
-    }
-
-    fn do_erase_memory_global(&mut self) -> Result<()> {
-        context_scope(
-            || {
-                self.send_cmd(Cmd::EraseMemory)?;
-
-                self.send_with_check_inv(&[0xFF])
-                    .context("failed to send global erase signal to bootloader")?;
-                self.get_ack()
-                    .context("bootloader did not accept global erase signal")?;
-                Ok(())
-            },
-            || "failed to execute global erase",
-        )
-    }
-
-    fn do_extended_erase_memory(&mut self, pages: &[u16]) -> Result<()> {
-        let count = pages.len();
-        let count_m1 = count.checked_sub(1).expect("erase-memory size cannot be 0");
-        let count_m1 = u16::try_from(count_m1).expect("can't erase more than 0xFFF1 pages");
-        if count_m1 >= 0xFFF0 {
-            panic!("can't erase more than 0xFFF1 pages");
-        }
-
-        context_scope(
-            || {
-                self.send_cmd(Cmd::ExtendedEraseMemory)?;
-
-                // Copy here is kind of lame but hey
-                let mut buffer = vec![];
-                buffer.extend(count_m1.to_be_bytes());
-                for p in pages {
-                    buffer.extend(p.to_be_bytes());
-                }
-                self.send_with_check_inv(&buffer)
-                    .context("failed to send page addresses to bootloader")?;
-                self.get_ack()
-                    .context("bootloader did not accept page addresses")?;
-                Ok(())
-            },
-            || format!("can't erase {count} pages"),
-        )
-    }
-
-    fn do_extended_erase_memory_global(&mut self) -> Result<()> {
-        context_scope(
-            || {
-                self.send_cmd(Cmd::ExtendedEraseMemory)?;
-
-                self.send_with_check_inv(&[0xFF, 0xFF])
-                    .context("failed to send global erase signal to bootloader")?;
-                self.get_ack()
-                    .context("bootloader did not accept global erase signal")?;
-                Ok(())
-            },
-            || "failed to execute global erase",
-        )
-    }
-
-    fn do_get_checksum(&mut self, address: u32, words: u32, polynomial: u32, initial: u32) -> Result<u32> {
-        self.send_cmd(Cmd::GetChecksum)?;
-
-        self.send_with_check_inv(&address.to_be_bytes())
-            .context("failed to send base address to bootloader")?;
-        self.get_ack()
-            .context("bootloader did not accept base address")?;
-
-        self.send_with_check_inv(&words.to_be_bytes())
-            .context("failed to send word count to bootloader")?;
-        self.get_ack()
-            .context("bootloader did not accept word count")?;
-
-        self.send_with_check_inv(&polynomial.to_be_bytes())
-            .context("failed to send polynomial to bootloader")?;
-        self.get_ack()
-            .context("bootloader did not accept polynomial")?;
-
-        self.send_with_check_inv(&initial.to_be_bytes())
-            .context("failed to send initial value to bootloader")?;
-        self.get_ack()
-            .context("bootloader did not accept initial value")?;
-
-        let mut crc = [0; 5];
-        self.0.read_exact(&mut crc)
-            .context("failed to read CRC result")?;
-        let (crc32, checksum) = (u32::from_be_bytes(crc[..4].try_into().unwrap()), crc[4]);
-        let rxcrc = crc[..4].iter().fold(0, |x, byte| x ^ *byte);
-        if rxcrc != checksum {
-            bail!("computed checksum {rxcrc:#x} does not match {checksum:#x}");
-        }
-
-        Ok(crc32)
-    }
-
-    fn do_go(&mut self, address: u32) -> Result<()> {
-        context_scope(
-            || {
-                self.send_cmd(Cmd::Go)?;
-
-                self.send_with_check_inv(&address.to_be_bytes())?;
-                self.get_ack()?;
-
-                Ok(())
-            },
-            || format!("failed to start program using table at address {address:#x}"),
-        )
-    }
-}
-
-fn context_scope<T, C>(
-    body: impl FnOnce() -> Result<T>,
-    context_provider: impl FnOnce() -> C,
-) -> Result<T>
-    where C: Display + Send + Sync + 'static,
-{
-    body().with_context(context_provider)
-}
-
-enum Pid {
-    Stm32(Stm32Kind),
-    Other(Vec<u8>),
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, FromPrimitive)]
-#[allow(non_camel_case_types)]
-enum Stm32Kind {
-    C011xx = 0x43,
-    C031xx = 0x53,
-
-    G03xxx_G04xxx = 0x66,
-    G05xxx_G061xx = 0x56,
-    G07xxx_G08xxx = 0x60,
-    G0B0xx_G0B1xx_G0C1xx = 0x67,
-
-    G431xx_G441xx = 0x68,
-    G47xxx_G48xxx = 0x69,
-    G491xx_G4A1xx = 0x79,
-
-    L01xxx_L02xxx = 0x57,
-    L031xx_L041xx = 0x25,
-    L05xxx_L06xxx = 0x17,
-    L07xxx_L08xxx = 0x47,
-
-    L412xx_L422xx = 0x64,
-    L43xxx_L44xxx = 0x35,
-    L45xxx_L46xxx = 0x62,
-    L47xxx_L48xxx = 0x15,
-    L496xx_L4A6xx = 0x61,
-    L4Rxx_L4Sxx = 0x70,
-    L4Pxx_L4Qxx = 0x90,
-}
-
-impl Stm32Kind {
-    fn bootloader_id_address(self) -> u32 {
-        use Stm32Kind::*;
-        match self {
-            C011xx | C031xx => 0x1FFF_17FE,
-            G07xxx_G08xxx => 0x1FFF_6FFE,
-            G03xxx_G04xxx | G05xxx_G061xx => 0x1FFF_1FFE,
-            G0B0xx_G0B1xx_G0C1xx => 0x1FFF_9FFE,
-
-            G431xx_G441xx | G47xxx_G48xxx | G491xx_G4A1xx => 0x1FFF_6FFE,
-
-            L01xxx_L02xxx | L031xx_L041xx | L05xxx_L06xxx => 0x1FF0_0FFE,
-            L07xxx_L08xxx => 0x1FF0_1FFE,
-
-            L412xx_L422xx | L43xxx_L44xxx | L45xxx_L46xxx | L47xxx_L48xxx | L496xx_L4A6xx | L4Rxx_L4Sxx | L4Pxx_L4Qxx => 0x1FFF_6FFE,
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, FromPrimitive)]
-#[allow(non_camel_case_types)]
-enum Stm32PreciseKind {
-    C011xx = 0x43,
-    C031xx = 0x53,
-
-    G03xxx_G04xxx = 0x66,
-    G05xxx_G061xx = 0x56,
-    G07xxx_G08xxx = 0x60,
-    G0B0xx_G0B1xx_G0C1xx = 0x67,
-
-    G431xx_G441xx = 0x68,
-    G47xxx_G48xxx = 0x69,
-    G491xx_G4A1xx = 0x79,
-
-    L01xxx_L02xxx = 0x57,
-    L031xx_L041xx = 0x25,
-    L05xxx_L06xxx = 0x17,
-    L07xxx_L08xxx = 0x47,
-
-    L412xx_L422xx = 0x64,
-    L43xxx_L44xxx = 0x35,
-    L45xxx_L46xxx = 0x62,
-    L47xxx_L48xxx = 0x15,
-    L496xx_L4A6xx = 0x61,
-    L4Rxx_L4Sxx = 0x70,
-    L4Pxx_L4Qxx = 0x90,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, FromPrimitive, enum_map::Enum)]
-enum Cmd {
-    Get = 0x00,
-    GetId = 0x02,
-    ReadMemory = 0x11,
-    Go = 0x21,
-    WriteMemory = 0x31,
-    EraseMemory = 0x43,
-    ExtendedEraseMemory = 0x44,
-    GetChecksum = 0xA1,
-}
-
-bitflags::bitflags! {
-    #[derive(Debug)]
-    struct Ifaces: u32 {
-        const USART = 1 << 0;
-        const SECOND_USART = 1 << 1;
-        const CAN = 1 << 2;
-        const DFU = 1 << 3;
-        const I2C = 1 << 4;
-        const SPI = 1 << 5;
-        const I3C = 1 << 6;
-    }
-}
-
-fn decode_blid(blid: u8) -> (Ifaces, u8) {
-    let ifaces = match blid >> 4 {
-        1 => Ifaces::USART,
-        2 => Ifaces::USART | Ifaces::SECOND_USART,
-        3 => Ifaces::USART | Ifaces::CAN | Ifaces::DFU,
-        4 => Ifaces::USART | Ifaces::DFU,
-        5 => Ifaces::USART | Ifaces::I2C,
-        6 => Ifaces::I2C,
-        7 => Ifaces::USART | Ifaces::CAN | Ifaces::DFU | Ifaces::I2C,
-        8 => Ifaces::I2C | Ifaces::SPI,
-        9 => Ifaces::USART | Ifaces::CAN | Ifaces::DFU | Ifaces::I2C | Ifaces::SPI,
-        10 => Ifaces::USART | Ifaces::DFU | Ifaces::I2C,
-        11 => Ifaces::USART | Ifaces::I2C | Ifaces::SPI,
-        12 => Ifaces::USART | Ifaces::SPI,
-        13 => Ifaces::USART | Ifaces::DFU | Ifaces::I2C | Ifaces::SPI,
-        14 => Ifaces::USART | Ifaces::DFU | Ifaces::I2C | Ifaces::I3C | Ifaces::CAN | Ifaces::SPI,
-        _ => Ifaces::empty(),
-    };
-    (ifaces, blid & 0xF)
 }

@@ -1,0 +1,27 @@
+# `stm32-uart-boot`
+
+This is a basic command-line tool for interacting with the serial bootloader on
+most STM32 chips. It is intended to be cross-platform and self-contained. In
+particular, it doesn't depend on you having the right versions of a bunch of
+libraries installed.
+
+To use the tool from a clone of this repo:
+
+`cargo run /dev/ttyUSB0 ping`
+
+(where you have replaced `/dev/ttyUSB0` with the proper name for the serial port
+on your platform -- e.g. `COM1` on Windows.)
+
+To install the tool so you can use it later:
+
+`cargo install --path . --locked`
+
+This will put a binary named `stm32-uart-boot` in your Cargo binaries directory.
+
+# Limitations
+
+There are some chip-ID tables in the tool that I've only populated with the
+subsets of models that I care about. This _should_ only affect chip
+identification and display, and not flashing. Feel free to send me a PR to add
+chip models -- please use the values and series abbreviations in ST Application
+Note 2606.
