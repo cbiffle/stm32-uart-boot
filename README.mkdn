@@ -25,6 +25,24 @@ To install the tool so you can use it later:
 
 This will put a binary named `stm32-uart-boot` in your Cargo binaries directory.
 
+## Flashing
+
+The most common thing you might want to do is to flash a chip from a `.bin` file
+containing some firmware. Assuming the firmware is linked to start at the base
+of flash, the commands for this are (replace YOURPORT with the name of the
+serial port on your system):
+
+```
+stm32-uart-boot YOURPORT global-erase
+stm32-uart-boot YOURPORT write-memory 0x08000000 your-firmware-file-here.bin
+```
+
+...and then hit reset. To boot into the firmware directly you can also try
+
+```
+stm32-uart-boot YOURPORT go 0x08000000
+```
+
 ## Commands
 
 The tool included in this crate can do the following things. Use the online help
