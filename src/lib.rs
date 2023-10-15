@@ -25,6 +25,10 @@ impl Boot {
         Boot(port)
     }
 
+    pub fn into_port(self) -> Box<dyn SerialPort> {
+        self.0
+    }
+
     pub fn drain(&mut self) -> Result<(), Error> {
         let saved_timeout = self.0.timeout();
 
