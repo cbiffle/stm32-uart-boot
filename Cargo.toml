@@ -9,6 +9,7 @@ anyhow = "1.0.71"
 bitflags = "2.3.2"
 clap = { version = "4.3.4", features = ["derive", "wrap_help"] }
 enum-map = "2.5.0"
+goblin = { version = "0.7.1", default-features = false, features = ["elf32", "std", "elf64", "endian_fd"] }
 indicatif = "0.17.5"
 num-derive = "0.3.3"
 num-traits = "0.2.15"

@@ -27,21 +27,24 @@ This will put a binary named `stm32-uart-boot` in your Cargo binaries directory.
 
 ## Flashing
 
-The most common thing you might want to do is to flash a chip from a `.bin` file
-containing some firmware. Assuming the firmware is linked to start at the base
-of flash, the commands for this are (replace YOURPORT with the name of the
-serial port on your system):
+The most common thing you might want to do is to flash a chip. The easiest way
+to do this is with the `load` command. If you've got an ELF file:
 
 ```
-stm32-uart-boot YOURPORT global-erase
-stm32-uart-boot YOURPORT write-memory 0x08000000 your-firmware-file-here.bin
+stm32-uart-boot YOURPORT load path/to/your/elf-file
 ```
 
-...and then hit reset. To boot into the firmware directly you can also try
+...and hit reset. (Replace YOURPORT with the name of the serial port on your system.)
+
+If you've got a raw binary file, you'll need to know what address it's linked
+for. On STM32 that's usually, but not always, `0x0800_0000`. Provide that with
+the `-a` or `--address` flag:
 
 ```
-stm32-uart-boot YOURPORT go 0x08000000
+stm32-uart-boot YOURPORT load path/to/your/file.bin -a 0x0800_0000
 ```
+
+...and then hit reset.
 
 ## Commands
 
@@ -51,8 +54,9 @@ The tool included in this crate can do the following things. Use the online help
 ```
 A tool for interacting with the built-in UART bootloader on most STM32 parts.
 
-For this to work, the chip must be booted into the bootloader. This will happen by default on a factory-fresh chip; after it's been programmed, the method for
-getting back into the bootloader depends on the chip and circuit.
+For this to work, the chip must be booted into the bootloader. This will happen by
+default on a factory-fresh chip; after it's been programmed, the method for getting back
+into the bootloader depends on the chip and circuit.
 
 Usage: stm32-uart-boot [OPTIONS] <PORT> <COMMAND>
 
@@ -61,6 +65,8 @@ Commands:
                                  handshake message and verifying the response
   info                       Dumps as much info about a connected chip as we can
                                  easily determine
+  load                       High-level command for loading a chip from a variety of
+                                 file formats
   get                        Runs the GET low-level command, which reports which
                                  other commands the bootloader supports
   get-id                     Runs the GET-ID low-level command, reporting chip ID

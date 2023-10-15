@@ -5,9 +5,9 @@
 //! makes sense to have both kinds of commands for a single concept, the
 //! low-level one is typically prefixed with `raw-`.
 
-use std::{time::Duration, path::PathBuf};
+use std::{time::Duration, path::PathBuf, collections::BTreeMap};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, anyhow};
 use enum_map::Enum;
 use indicatif::ProgressBar;
 use serialport::Parity;
@@ -40,6 +40,30 @@ enum SubCmd {
     Ping,
     /// Dumps as much info about a connected chip as we can easily determine.
     Info,
+    /// High-level command for loading a chip from a variety of file formats.
+    ///
+    /// Currently this implies a global erase of the chip, for simplicity.
+    Load {
+        /// Input file in ELF or raw BIN format. This will be attempted as ELF
+        /// first; if that fails, we'll assume it's BIN. To override this logic
+        /// pass -f/--format explicitly.
+        filename: PathBuf,
+
+        /// Force interpretation of the input file in a particular file format.
+        #[clap(short, long)]
+        format: Option<FileFormat>,
+
+        /// Provide a load address for the image. This is required for file
+        /// formats that don't have address information (primarily .bin).
+        /// If the file contains address information, providing this is an
+        /// error because it's not clear what to do.
+        #[clap(short, long, value_parser = parse_int::parse::<u32>)]
+        address: Option<u32>,
+
+        /// Verify contents after writing.
+        #[clap(long)]
+        verify: bool,
+    },
     /// Runs the GET low-level command, which reports which other commands the
     /// bootloader supports.
     Get,
@@ -141,6 +165,12 @@ enum SubCmd {
     },
 }
 
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+enum FileFormat {
+    Binary,
+    Elf,
+}
+
 fn main() -> Result<()> {
     let args = BootTool::parse();
 
@@ -188,6 +218,55 @@ fn main() -> Result<()> {
             }
             if let Some(v) = info.bootloader_version {
                 println!("Bootloader version: {v}");
+            }
+        }
+        SubCmd::Load { filename, format, address, verify } => {
+            let image = std::fs::read(&filename)
+                .with_context(|| format!("reading image file {}", filename.display()))?;
+            let (segments, used_address) = match format {
+                Some(FileFormat::Binary) => load_binary(&image, address)?,
+                Some(FileFormat::Elf) => load_elf(&image)?,
+                None => load_auto(&image, address)?,
+            };
+            if !used_address && address.is_some() {
+                bail!("Flag -a/--address is not valid for this file format.");
+            }
+
+            let segments = merge_adjacent(segments);
+            if args.verbose {
+                println!("Segment map after merge:");
+                for (address, segment) in &segments {
+                    println!("  {address:08x}: {} bytes", segment.len());
+                }
+            }
+
+            for (address, segment) in &segments {
+                if segment.len() % 4 != 0 {
+                    bail!("STM32 will only accept data written in units of \
+                        4 bytes; segment at {address:#x} is {} bytes long",
+                        segment.len());
+                }
+            }
+            
+            let info = boot.info()
+                .context("checking command support")?;
+
+            boot.drain()?;
+
+            println!("Erasing...");
+            if info.command_support[Cmd::EraseMemory] {
+                boot.do_erase_memory_global()?;
+            } else if info.command_support[Cmd::ExtendedEraseMemory] {
+                boot.do_extended_erase_memory_global()?;
+            } else {
+                bail!("device does not report any supported erase memory commands");
+            }
+
+            if segments.len() != 1 {
+                println!("Writing {} segments...", segments.len());
+            }
+            for (&address, segment) in &segments {
+                do_write(&mut boot, &segment, address, verify, args.verbose)?;
             }
         }
         SubCmd::Get => {
@@ -273,19 +352,7 @@ fn main() -> Result<()> {
                 bail!("must write in units of 4 bytes");
             }
 
-            println!("writing {} bytes...", data.len());
-            let bar = ProgressBar::new(data.len() as u64);
-            for (i, chunk) in data.chunks(256).enumerate() {
-                let chunk_addr = address + i as u32 * 256;
-                boot.do_write_memory(chunk_addr, chunk)?;
-                bar.inc(chunk.len() as u64);
-            }
-            bar.finish();
-
-            if verify {
-                do_verify(&mut boot, &data, address, args.verbose)?;
-                println!("OK: matches what was intended");
-            }
+            do_write(&mut boot, &data, address, verify, args.verbose)?;
         }
         SubCmd::FillMemory { mut address, count, byte } => {
             boot.require_cmd(Cmd::WriteMemory)?;
@@ -415,6 +482,107 @@ fn do_verify(
     bar.finish();
     if issues != 0 {
         bail!("memory contents failed to match at {issues} addresses");
+    }
+    Ok(())
+}
+
+fn load_binary(
+    image: &[u8],
+    address: Option<u32>,
+) -> Result<(BTreeMap<u32, Vec<u8>>, bool)> {
+    let address = address.ok_or_else(|| anyhow!("Must provide -a/--address flag for .bin file"))?;
+    Ok(([(address, image.to_vec())].into_iter().collect(), true))
+}
+
+fn load_elf(
+    image: &[u8],
+) -> Result<(BTreeMap<u32, Vec<u8>>, bool)> {
+    use goblin::elf::Elf;
+    let elf = Elf::parse(image)?;
+
+    let mut segments = BTreeMap::new();
+    for ph in &elf.program_headers {
+        if ph.p_type == goblin::elf::program_header::PT_LOAD {
+            // A thing that should actually be written!
+            let fr = ph.file_range();
+            if let Some(bytes) = image.get(fr.clone()) {
+                if bytes.is_empty() {
+                    // Skip empty ranges.
+                    continue;
+                }
+
+                let loadaddr = u32::try_from(ph.p_paddr)
+                    .with_context(|| format!("PhysAddr {:08x} won't fit in u32", ph.p_paddr))?;
+
+                segments.insert(loadaddr, bytes.to_vec());
+            } else {
+                bail!("ELF PHDR references range {fr:?} but file is only {} bytes long",
+                    image.len());
+            }
+        }
+    }
+
+    Ok((segments, false))
+}
+
+fn load_auto(
+    image: &[u8],
+    address: Option<u32>,
+) -> Result<(BTreeMap<u32, Vec<u8>>, bool)> {
+    let elf_err = match load_elf(&image) {
+        Ok(s) => {
+            println!("Detected ELF format.");
+            return Ok(s);
+        }
+        Err(e) => e,
+    };
+    let bin_err = match load_binary(&image, address) {
+        Ok(s) => {
+            println!("Loaded as raw BIN file.");
+            return Ok(s);
+        }
+        Err(e) => e,
+    };
+
+    bail!("Unable to load file as any format.\n\
+            As ELF: {elf_err}\n\
+            As BIN: {bin_err}")
+}
+
+fn merge_adjacent(segments: BTreeMap<u32, Vec<u8>>) -> BTreeMap<u32, Vec<u8>> {
+    let mut output: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+    let mut last_end = None;
+    for (address, data) in segments {
+        let n = data.len();
+        if last_end == Some(address) {
+            output.last_entry().unwrap().get_mut().extend_from_slice(&data[..]);
+        } else {
+            output.insert(address, data);
+        }
+        last_end = Some(address + u32::try_from(n).unwrap());
+    }
+    output
+}
+
+fn do_write(
+    boot: &mut Boot,
+    data: &[u8],
+    address: u32,
+    verify: bool,
+    verbose: bool,
+) -> Result<()> {
+    println!("writing {} bytes...", data.len());
+    let bar = ProgressBar::new(data.len() as u64);
+    for (i, chunk) in data.chunks(256).enumerate() {
+        let chunk_addr = address + i as u32 * 256;
+        boot.do_write_memory(chunk_addr, chunk)?;
+        bar.inc(chunk.len() as u64);
+    }
+    bar.finish();
+
+    if verify {
+        do_verify(boot, &data, address, verbose)?;
+        println!("OK: matches what was intended");
     }
     Ok(())
 }
