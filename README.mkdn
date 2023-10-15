@@ -1,9 +1,11 @@
 # `stm32-uart-boot`
 
-This is a basic command-line tool for interacting with the serial bootloader on
-most STM32 chips. It is intended to be cross-platform and self-contained. In
-particular, it doesn't depend on you having the right versions of a bunch of
-libraries installed.
+This is a basic crate and command-line tool for interacting with the serial
+bootloader on most STM32 chips. It is intended to be cross-platform and
+self-contained. In particular, it doesn't depend on having the right versions of
+a bunch of libraries installed.
+
+## Running the command line tool
 
 To use the tool from a clone of this repo:
 
@@ -18,7 +20,12 @@ To install the tool so you can use it later:
 
 This will put a binary named `stm32-uart-boot` in your Cargo binaries directory.
 
-# Limitations
+## Using the crate
+
+The command line tool is written in terms of the public API of the crate, so if
+you'd like to do something with automated bootloader interaction ... have at it!
+
+## Limitations
 
 There are some chip-ID tables in the tool that I've only populated with the
 subsets of models that I care about. This _should_ only affect chip
