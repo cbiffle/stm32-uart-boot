@@ -5,6 +5,11 @@ bootloader on most STM32 chips. It is intended to be cross-platform and
 self-contained. In particular, it doesn't depend on having the right versions of
 a bunch of libraries installed.
 
+## Using the crate
+
+The command line tool is written in terms of the public API of the crate, so if
+you'd like to do something with automated bootloader interaction ... have at it!
+
 ## Running the command line tool
 
 To use the tool from a clone of this repo:
@@ -20,10 +25,66 @@ To install the tool so you can use it later:
 
 This will put a binary named `stm32-uart-boot` in your Cargo binaries directory.
 
-## Using the crate
+## Commands
 
-The command line tool is written in terms of the public API of the crate, so if
-you'd like to do something with automated bootloader interaction ... have at it!
+The tool included in this crate can do the following things. Use the online help
+(with either `--help` or `some-subcommand-here --help`) to get specifics.
+
+```
+A tool for interacting with the built-in UART bootloader on most STM32 parts.
+
+For this to work, the chip must be booted into the bootloader. This will happen by default on a factory-fresh chip; after it's been programmed, the method for
+getting back into the bootloader depends on the chip and circuit.
+
+Usage: stm32-uart-boot [OPTIONS] <PORT> <COMMAND>
+
+Commands:
+  ping                       Checks basic connectivity to the bootloader by sending a
+                                 handshake message and verifying the response
+  info                       Dumps as much info about a connected chip as we can
+                                 easily determine
+  get                        Runs the GET low-level command, which reports which
+                                 other commands the bootloader supports
+  get-id                     Runs the GET-ID low-level command, reporting chip ID
+                                 only
+  dump-memory                Reads a block of memory from the chip and presents it in
+                                 hex-dump form
+  read-memory                Reads a block of memory from the chip into a file
+  write-memory               Writes the contents of a file into memory on the chip
+  fill-memory                Writes a repeating byte over a portion of memory in the
+                                 chip
+  verify-memory              Reads out a block of memory from the chip and compares
+                                 it to the contents of a file
+  go                         Leaves the bootloader and activates a program, given the
+                                 address of its vector table
+  global-erase               Issues a global erase command, which erases all of flash
+                                 and may reset other things (like protection settings)
+                                 depending on the chip
+  get-checksum               Computes the CRC32 of a section of memory in the chip,
+                                 if the chip supports this command -- many don't
+  raw-write-memory           
+  raw-erase-memory           
+  raw-extended-erase-memory  
+  help                       Print this message or the help of the given
+                                 subcommand(s)
+
+Arguments:
+  <PORT>
+          
+
+Options:
+  -b, --baud-rate <BAUD_RATE>
+          [default: 115200]
+
+  -v, --verbose
+          
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
+```
 
 ## Limitations
 
